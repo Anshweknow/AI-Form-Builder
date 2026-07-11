@@ -68,7 +68,7 @@ export default function DocumentUpload({
           <span className="step-badge">2</span>
           <div>
             <h2>Upload a document</h2>
-            <span className="card-sub">PDF, PNG, JPG or JPEG — up to 25 MB</span>
+            <span className="card-sub">PDF, PNG, JPG or JPEG — up to 15 MB</span>
           </div>
         </div>
       </div>

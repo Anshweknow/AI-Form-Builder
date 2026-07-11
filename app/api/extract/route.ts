@@ -1,24 +1,29 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenAI, Type, type Schema } from "@google/genai";
 
-import { buildExtractionTool } from "@/lib/schema";
 import { ACCEPTED_MIME } from "@/lib/types";
 import type { FormField, ExtractionResult } from "@/lib/types";
 
-// The Anthropic SDK needs the Node.js runtime (not the Edge runtime).
+// The Google GenAI SDK needs the Node.js runtime (not the Edge runtime).
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const MAX_BYTES = 25 * 1024 * 1024; // 25 MB — Claude's request limit is 32 MB.
-const DEFAULT_MODEL = "claude-opus-4-8";
+// Gemini accepts inline file data up to ~20 MB per request (base64 inflates the
+// bytes ~33%), so cap the raw upload comfortably below that.
+const MAX_BYTES = 15 * 1024 * 1024;
+const DEFAULT_MODEL = "gemini-2.5-flash";
+
+function apiKey(): string | undefined {
+  return process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+}
 
 export async function POST(req: Request) {
   // --- Preflight: make sure the app is actually configured. ---------------
-  if (!process.env.ANTHROPIC_API_KEY) {
+  if (!apiKey()) {
     return NextResponse.json(
       {
         error:
-          "The server is missing an ANTHROPIC_API_KEY. Copy .env.example to .env.local, add your key, and restart.",
+          "The server is missing a GEMINI_API_KEY. Copy .env.example to .env.local, add your key, and restart.",
       },
       { status: 500 },
     );
@@ -73,7 +78,7 @@ export async function POST(req: Request) {
   }
   if (file.size > MAX_BYTES) {
     return NextResponse.json(
-      { error: "That file is too large (max 25 MB). Please upload a smaller document." },
+      { error: "That file is too large (max 15 MB). Please upload a smaller document." },
       { status: 413 },
     );
   }
@@ -81,63 +86,53 @@ export async function POST(req: Request) {
   const base64 = Buffer.from(await file.arrayBuffer()).toString("base64");
 
   // --- Build the schema-driven request. -----------------------------------
-  const tool = buildExtractionTool(fields);
-
-  // PDFs go in as a `document` block; images as an `image` block. Claude reads
-  // both natively (native PDF understanding + vision) — no separate OCR step.
-  const documentBlock =
-    mediaType === "application/pdf"
-      ? {
-          type: "document",
-          source: { type: "base64", media_type: "application/pdf", data: base64 },
-        }
-      : {
-          type: "image",
-          source: { type: "base64", media_type: mediaType, data: base64 },
-        };
-
+  // Gemini reads PDFs and images natively; the response is constrained to a
+  // JSON object keyed by field id, so there's no brittle prose parsing.
+  const responseSchema = buildResponseSchema(fields);
   const instructions = buildPrompt(fields);
 
-  const client = new Anthropic();
-  const model = process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
+  const ai = new GoogleGenAI({ apiKey: apiKey() });
+  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
 
   try {
-    const message = await client.messages.create({
+    const response = await ai.models.generateContent({
       model,
-      max_tokens: 4096,
-      tools: [tool as unknown as Anthropic.Tool],
-      // Force the model to answer through our schema — no free-form prose.
-      tool_choice: { type: "tool", name: "fill_form" },
-      messages: [
+      contents: [
         {
           role: "user",
-          // Cast at the SDK boundary: the block shapes are built dynamically
-          // above but are valid document/image/text content blocks.
-          content: [documentBlock, { type: "text", text: instructions }] as unknown as Anthropic.ContentBlockParam[],
+          parts: [
+            { inlineData: { mimeType: mediaType, data: base64 } },
+            { text: instructions },
+          ],
         },
       ],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema,
+        maxOutputTokens: 8192,
+        temperature: 0,
+      },
     });
 
-    if (message.stop_reason === "refusal") {
+    const text = response.text;
+    if (!text) {
       return NextResponse.json(
-        { error: "The document could not be processed for safety reasons." },
-        { status: 422 },
-      );
-    }
-
-    const toolUse = message.content.find(
-      (block): block is Anthropic.ToolUseBlock =>
-        block.type === "tool_use" && block.name === "fill_form",
-    );
-
-    if (!toolUse) {
-      return NextResponse.json(
-        { error: "The AI did not return any values. Please try again." },
+        { error: "The AI could not read that document. Please try a clearer file." },
         { status: 502 },
       );
     }
 
-    return NextResponse.json({ results: toolUse.input as ExtractionResult });
+    let results: ExtractionResult;
+    try {
+      results = JSON.parse(text) as ExtractionResult;
+    } catch {
+      return NextResponse.json(
+        { error: "The AI returned an unexpected response. Please try again." },
+        { status: 502 },
+      );
+    }
+
+    return NextResponse.json({ results });
   } catch (err) {
     return NextResponse.json({ error: friendlyError(err) }, { status: 502 });
   }
@@ -151,6 +146,89 @@ function mimeFromName(name: string): string | null {
   return null;
 }
 
+/**
+ * Build the Gemini `responseSchema`: one required property per form field
+ * (keyed by field id), each an object of `{ value, confidence }`. The `value`
+ * type is chosen from the field's type and is nullable so the model can leave
+ * anything it can't find blank.
+ */
+function buildResponseSchema(fields: FormField[]): Schema {
+  const properties: Record<string, Schema> = {};
+  const required: string[] = [];
+
+  for (const field of fields) {
+    properties[field.id] = {
+      type: Type.OBJECT,
+      description: fieldGuidance(field),
+      properties: {
+        value: valueSchema(field),
+        confidence: {
+          type: Type.STRING,
+          enum: ["high", "medium", "low"],
+          description:
+            "How sure you are this value is correct for this field. Use 'low' if you are guessing.",
+        },
+      },
+      required: ["value", "confidence"],
+      propertyOrdering: ["value", "confidence"],
+    };
+    required.push(field.id);
+  }
+
+  return {
+    type: Type.OBJECT,
+    properties,
+    required,
+    propertyOrdering: fields.map((f) => f.id),
+  };
+}
+
+function valueSchema(field: FormField): Schema {
+  switch (field.type) {
+    case "number":
+      return { type: Type.NUMBER, nullable: true };
+    case "checkbox":
+      return { type: Type.BOOLEAN, nullable: true };
+    case "dropdown": {
+      const options = field.options.filter((o) => o.trim().length > 0);
+      if (options.length > 0) return { type: Type.STRING, enum: options, nullable: true };
+      return { type: Type.STRING, nullable: true };
+    }
+    default:
+      return { type: Type.STRING, nullable: true };
+  }
+}
+
+function fieldGuidance(field: FormField): string {
+  const bits: string[] = [`Label: "${field.label || "(untitled)"}"`];
+  switch (field.type) {
+    case "number":
+      bits.push("Return a numeric value only, or null if none found.");
+      break;
+    case "date":
+      bits.push('Return an ISO date string "YYYY-MM-DD", or null.');
+      break;
+    case "checkbox":
+      bits.push("Return true or false, or null if unknown.");
+      break;
+    case "dropdown":
+      bits.push(
+        `Return EXACTLY one of: ${field.options
+          .filter((o) => o.trim())
+          .map((o) => `"${o}"`)
+          .join(", ") || "(no options defined)"} — or null if none fits.`,
+      );
+      break;
+    case "textarea":
+      bits.push("Long text; multiple lines / items are fine, or null.");
+      break;
+    default:
+      bits.push("Short text, or null.");
+  }
+  if (field.required) bits.push("This field is required.");
+  return bits.join(" ");
+}
+
 function buildPrompt(fields: FormField[]): string {
   const lines = fields
     .map((f) => `- id "${f.id}": ${f.label || "(untitled)"} [${f.type}]`)
@@ -158,7 +236,7 @@ function buildPrompt(fields: FormField[]): string {
 
   return [
     "You are extracting data from the attached document to fill a form a user designed.",
-    "Call the `fill_form` tool exactly once, providing an entry for every field id below.",
+    "Return a JSON object with an entry for every field id below.",
     "",
     "Fields:",
     lines,
@@ -172,17 +250,15 @@ function buildPrompt(fields: FormField[]): string {
 }
 
 function friendlyError(err: unknown): string {
-  if (err instanceof Anthropic.AuthenticationError) {
-    return "The ANTHROPIC_API_KEY was rejected. Check the key in .env.local.";
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/API key|API_KEY_INVALID|permission|401|403/i.test(msg)) {
+    return "The GEMINI_API_KEY was rejected. Check the key in .env.local (or your host's env vars).";
   }
-  if (err instanceof Anthropic.RateLimitError) {
-    return "The AI service is rate-limited right now. Please wait a moment and retry.";
+  if (/quota|rate|429|RESOURCE_EXHAUSTED/i.test(msg)) {
+    return "The AI service is rate-limited or out of quota right now. Please wait a moment and retry.";
   }
-  if (err instanceof Anthropic.BadRequestError) {
+  if (/unsupported|invalid|corrupt/i.test(msg)) {
     return "The document could not be read — it may be corrupted or password-protected.";
-  }
-  if (err instanceof Anthropic.APIError) {
-    return "The AI service returned an error. Please try again.";
   }
   return "Something went wrong while extracting. Please try again.";
 }

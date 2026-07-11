@@ -1,110 +1,11 @@
-// Turns a user-built form into a JSON Schema the AI must fill, and turns the
-// AI's answer back into concrete form values. This is what makes extraction
-// "schema-driven": the shape of the request is derived entirely from whatever
-// fields the user configured at runtime — nothing about the fields is hardcoded.
+// Turns the AI's per-field answer back into concrete, type-checked form values.
+// (The request schema Gemini must fill is built server-side in the API route —
+// see app/api/extract/route.ts. Both are derived entirely from the user's
+// runtime-built fields, which is what makes the extraction "schema-driven".)
+//
+// This file imports no AI SDK, so it stays safe to use in the browser bundle.
 
 import type { FormField, FieldExtraction } from "./types";
-
-// A minimal JSON-schema shape. `any` here is deliberate: JSON Schema is
-// recursive and open-ended, and we only build a small, known subset of it.
-type JsonSchema = Record<string, unknown>;
-
-/** The per-field `value` sub-schema, chosen from the field's type. Always nullable. */
-function valueSchema(field: FormField): JsonSchema {
-  switch (field.type) {
-    case "number":
-      return { anyOf: [{ type: "number" }, { type: "null" }] };
-    case "checkbox":
-      return { anyOf: [{ type: "boolean" }, { type: "null" }] };
-    case "dropdown": {
-      const options = field.options.filter((o) => o.trim().length > 0);
-      if (options.length > 0) {
-        return { anyOf: [{ type: "string", enum: options }, { type: "null" }] };
-      }
-      return { anyOf: [{ type: "string" }, { type: "null" }] };
-    }
-    case "date":
-    case "text":
-    case "textarea":
-    default:
-      return { anyOf: [{ type: "string" }, { type: "null" }] };
-  }
-}
-
-function fieldGuidance(field: FormField): string {
-  const bits: string[] = [`Label: "${field.label || "(untitled)"}"`];
-  switch (field.type) {
-    case "number":
-      bits.push("Type: number. Return a numeric value only, or null if none found.");
-      break;
-    case "date":
-      bits.push('Type: date. Return an ISO date string "YYYY-MM-DD", or null.');
-      break;
-    case "checkbox":
-      bits.push("Type: yes/no. Return true or false, or null if unknown.");
-      break;
-    case "dropdown":
-      bits.push(
-        `Type: choice. Return EXACTLY one of: ${field.options
-          .filter((o) => o.trim())
-          .map((o) => `"${o}"`)
-          .join(", ") || "(no options defined)"} — or null if none fits.`,
-      );
-      break;
-    case "textarea":
-      bits.push("Type: long text. Multiple lines / items are fine, or null.");
-      break;
-    default:
-      bits.push("Type: short text, or null.");
-  }
-  if (field.required) bits.push("This field is required.");
-  return bits.join(" ");
-}
-
-/**
- * Build the Anthropic tool the model must call. The input schema has one
- * required property per form field (keyed by field id), each an object of
- * `{ value, confidence }`. Because every field id is `required` with
- * `additionalProperties: false`, the model is forced to address every field.
- */
-export function buildExtractionTool(fields: FormField[]) {
-  const properties: Record<string, JsonSchema> = {};
-  const required: string[] = [];
-
-  for (const field of fields) {
-    properties[field.id] = {
-      type: "object",
-      description: fieldGuidance(field),
-      properties: {
-        value: valueSchema(field),
-        confidence: {
-          type: "string",
-          enum: ["high", "medium", "low"],
-          description:
-            "How sure you are this value is correct for this field. Use 'low' if you are guessing.",
-        },
-      },
-      required: ["value", "confidence"],
-      additionalProperties: false,
-    };
-    required.push(field.id);
-  }
-
-  return {
-    name: "fill_form",
-    description:
-      "Record the value extracted from the document for every form field. " +
-      "Leave a field's value null when the document does not clearly contain it — never guess.",
-    // `strict` guarantees the returned input validates exactly against this schema.
-    strict: true,
-    input_schema: {
-      type: "object",
-      properties,
-      required,
-      additionalProperties: false,
-    },
-  };
-}
 
 export interface CoercedField {
   /** Value to place in the form control (string for inputs, boolean for checkbox). */
