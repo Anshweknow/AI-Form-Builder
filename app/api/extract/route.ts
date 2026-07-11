@@ -11,7 +11,12 @@ export const maxDuration = 60;
 // Gemini accepts inline file data up to ~20 MB per request (base64 inflates the
 // bytes ~33%), so cap the raw upload comfortably below that.
 const MAX_BYTES = 15 * 1024 * 1024;
-const DEFAULT_MODEL = "gemini-2.5-flash";
+// Fallback only — the model is normally discovered from the API key at runtime
+// (see chooseModel), so Google retiring a model version doesn't break the app.
+const DEFAULT_MODEL = "gemini-flash-latest";
+
+// Cache the resolved model across warm invocations of the serverless function.
+let cachedModel: string | null = null;
 
 function apiKey(): string | undefined {
   return process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
@@ -92,7 +97,7 @@ export async function POST(req: Request) {
   const instructions = buildPrompt(fields);
 
   const ai = new GoogleGenAI({ apiKey: apiKey() });
-  const model = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+  const model = await chooseModel(ai);
 
   try {
     const response = await ai.models.generateContent({
@@ -157,6 +162,57 @@ function mimeFromName(name: string): string | null {
   if (lower.endsWith(".png")) return "image/png";
   if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
   return null;
+}
+
+/**
+ * Pick a usable model for the caller's API key. Honours an explicit GEMINI_MODEL,
+ * otherwise lists the models available to the key and prefers a fast "flash"
+ * model — so the app keeps working when Google retires a specific version.
+ */
+async function chooseModel(ai: GoogleGenAI): Promise<string> {
+  const explicit = process.env.GEMINI_MODEL?.trim();
+  if (explicit) return explicit;
+  if (cachedModel) return cachedModel;
+  cachedModel = await resolveModel(ai);
+  return cachedModel;
+}
+
+async function resolveModel(ai: GoogleGenAI): Promise<string> {
+  const names: string[] = [];
+  try {
+    const pager = await ai.models.list();
+    for await (const m of pager) {
+      const name = (m.name ?? "").replace(/^models\//, "");
+      // Field name varies across SDK versions — read either defensively.
+      const rec = m as { supportedActions?: string[]; supportedGenerationMethods?: string[] };
+      const actions = rec.supportedActions ?? rec.supportedGenerationMethods ?? [];
+      if (name && (actions.length === 0 || actions.includes("generateContent"))) {
+        names.push(name);
+      }
+    }
+  } catch {
+    // Listing failed — fall back to the alias below.
+  }
+
+  const usable = names.filter(
+    (n) => /gemini/i.test(n) && !/embedding|image|tts|aqa|vision|live/i.test(n),
+  );
+  const flash = usable.filter((n) => /flash/i.test(n) && !/lite/i.test(n));
+
+  const latestFlash = flash.find((n) => /latest/i.test(n));
+  if (latestFlash) return latestFlash;
+  if (flash.length) return pickNewest(flash);
+  if (usable.length) return pickNewest(usable);
+  return DEFAULT_MODEL;
+}
+
+// Newest-looking name first: higher version numbers, stable preferred over preview/exp.
+function pickNewest(names: string[]): string {
+  return [...names].sort((a, b) => {
+    const stable = (n: string) => (/preview|exp/i.test(n) ? 1 : 0);
+    if (stable(a) !== stable(b)) return stable(a) - stable(b);
+    return b.localeCompare(a, undefined, { numeric: true });
+  })[0];
 }
 
 /**
