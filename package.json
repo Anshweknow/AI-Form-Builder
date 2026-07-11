@@ -1,0 +1,24 @@
+{
+  "name": "tecnots-form-autofill",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI-powered form builder & document autofill (Tecnots assessment — Question 1)",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.111.0",
+    "next": "16.2.10",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "typescript": "^5.0.0"
+  }
+}
