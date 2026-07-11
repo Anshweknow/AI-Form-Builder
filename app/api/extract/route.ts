@@ -111,13 +111,24 @@ export async function POST(req: Request) {
         responseSchema,
         maxOutputTokens: 8192,
         temperature: 0,
+        // gemini-2.5 "flash" models think by default, which can consume the
+        // whole output budget before any JSON is produced. Turn it off for this
+        // structured extraction so the tokens go to the answer.
+        ...(/flash/i.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
       },
     });
 
     const text = response.text;
     if (!text) {
+      const reason = response.candidates?.[0]?.finishReason;
+      console.error("Gemini returned no text", {
+        finishReason: reason,
+        promptFeedback: response.promptFeedback,
+      });
       return NextResponse.json(
-        { error: "The AI could not read that document. Please try a clearer file." },
+        {
+          error: `The AI returned no data (reason: ${reason ?? "unknown"}). Please try a clearer document.`,
+        },
         { status: 502 },
       );
     }
@@ -134,6 +145,8 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ results });
   } catch (err) {
+    // Log the full error to the server (visible in Vercel's Runtime Logs).
+    console.error("Extraction failed:", err);
     return NextResponse.json({ error: friendlyError(err) }, { status: 502 });
   }
 }
@@ -260,5 +273,7 @@ function friendlyError(err: unknown): string {
   if (/unsupported|invalid|corrupt/i.test(msg)) {
     return "The document could not be read — it may be corrupted or password-protected.";
   }
-  return "Something went wrong while extracting. Please try again.";
+  // Surface a trimmed real reason so failures are diagnosable from the UI.
+  const detail = msg.replace(/\s+/g, " ").trim().slice(0, 180);
+  return detail ? `Extraction failed: ${detail}` : "Something went wrong while extracting. Please try again.";
 }
